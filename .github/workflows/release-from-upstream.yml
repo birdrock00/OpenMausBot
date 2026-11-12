@@ -191,9 +191,21 @@ jobs:
         run: |
           set -euo pipefail
           echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$REGISTRY_USER" --password-stdin
-          docker push "$IMAGE:$TAG"
+          # A brand-new ghcr package name is registered by the first push attempt, which
+          # still answers "denied"; the next attempt succeeds. Retry a few times.
+          push() { docker push "$IMAGE:$1"; }
+          for i in 1 2 3; do
+            if push "$TAG"; then break; fi
+            [ "$i" = 3 ] && { echo "ghcr push of $IMAGE:$TAG denied after 3 attempts"; exit 1; }
+            echo "ghcr denied (new package registering); retrying in 15s ($i/3)"
+            sleep 15
+          done
           if [ "$IS_LATEST" = "true" ]; then
-            docker push "$IMAGE:latest"
+            for i in 1 2 3; do
+              if push latest; then break; fi
+              [ "$i" = 3 ] && { echo "ghcr push of $IMAGE:latest denied after 3 attempts"; exit 1; }
+              sleep 15
+            done
           fi
           docker images "$IMAGE" || true
 
