@@ -39,7 +39,6 @@ jobs:
     timeout-minutes: 10
     outputs:
       tag: ${{ steps.pick.outputs.tag }}
-      commit: ${{ steps.pick.outputs.commit }}
       publish: ${{ steps.decide.outputs.publish }}
       latest: ${{ steps.pick.outputs.latest }}
     steps:
@@ -66,15 +65,12 @@ jobs:
               exit 1
             fi
             tag="$FORCED_TAG"
-            commit=$(jq -r '.commit_url' <<<"$entry" | sed 's|.*commit/||')
           else
             tag="$latest"
-            commit=$(jq -r '.[0].commit_url' <<<"$releases" | sed 's|.*commit/||')
           fi
-          echo "tag=$tag"      >> "$GITHUB_OUTPUT"
-          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag"     >> "$GITHUB_OUTPUT"
           echo "latest=$latest" >> "$GITHUB_OUTPUT"
-          echo "Upstream: latest=$latest, publishing=$tag ($commit)"
+          echo "Upstream: latest=$latest, publishing=$tag"
 
       - name: Decide whether to publish
         id: decide
@@ -118,7 +114,6 @@ jobs:
       - name: Fetch the upstream release
         env:
           TAG: ${{ needs.detect.outputs.tag }}
-          COMMIT: ${{ needs.detect.outputs.commit }}
         run: |
           set -euo pipefail
           git remote add upstream https://github.com/$UPSTREAM.git
@@ -161,15 +156,25 @@ jobs:
             git tag -f -a "$TAG" "$commit" -m "OpenMausBot $TAG (mirrored from upstream)"
           fi
           git push origin "refs/tags/$TAG"
-          if gh release view "$TAG" >/dev/null 2>&1; then
+          # Strict existence check: the name returned by gh must be exactly this
+          # tag (a bare `gh release view` can return 0 for other releases).
+          existing=$(gh release view "$TAG" --json tagName -q '.tagName' 2>/dev/null || true)
+          if [ "$existing" = "$TAG" ]; then
             echo "Release $TAG already exists on this fork; keeping it."
           else
             notes=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" \
               "https://api.github.com/repos/$UPSTREAM/releases/tags/$TAG" | jq -r '.body // "Mirrored from upstream."')
-            body=$notes gh release create "$TAG" \
+            if ! body=$notes gh release create "$TAG" \
               --title "OpenMausBot ${TAG#v} (fork of upstream)" \
               --notes-file <(echo "$body") \
-              --target "$commit"
+              --target "$commit"; then
+              # A racing run may have created it between the check and the create.
+              if [ "$(gh release view "$TAG" --json tagName -q '.tagName' 2>/dev/null || true)" = "$TAG" ]; then
+                echo "Release $TAG was created concurrently; keeping it."
+              else
+                exit 1
+              fi
+            fi
           fi
 
       - name: Build the Docker image (repo Dockerfile, server target)
@@ -228,11 +233,12 @@ jobs:
       - name: Record state
         env:
           TAG: ${{ needs.detect.outputs.tag }}
-          COMMIT: ${{ needs.detect.outputs.commit }}
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          printf '{"last_tag": "%s", "last_commit": "%s"}\n' "$TAG" "$COMMIT" > .github/release-state.json
+          # The commit behind the (possibly re-pointed) tag, from the local tag object.
+          commit=$(git rev-parse "refs/tags/$TAG^{commit}")
+          printf '{"last_tag": "%s", "last_commit": "%s"}\n' "$TAG" "$commit" > .github/release-state.json
           git config user.name  "birdrock00[bot]"
           git config user.email "birdrock00@users.noreply.github.com"
           git add .github/release-state.json
