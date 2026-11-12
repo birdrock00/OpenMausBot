@@ -1,0 +1,76 @@
+# Fork maintenance: pull all changes from upstream (milind-soni/OpenMausBot)
+# into this fork's main branch. Runs daily, on demand, and as a fallback for
+# release-from-upstream.yml's merge step.
+#
+# The fork only ever diverges from upstream in .github/workflows/ (this file
+# and release-from-upstream.yml), so a plain --no-ff merge cannot conflict;
+# if it ever does, the job fails loudly instead of guessing.
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "30 6 * * *" # daily, 06:30 UTC
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Fork branch to update (default main)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.branch || 'main' }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Fetch upstream
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/milind-soni/OpenMausBot.git
+          git fetch upstream --prune
+          # The fork's main descends from an upstream commit, so a full
+          # upstream fetch guarantees the merge base exists locally.
+          git fetch upstream main
+          echo "upstream/main at $(git rev-parse --short upstream/main)"
+
+      - name: Merge upstream/main
+        id: merge
+        env:
+          BRANCH: ${{ inputs.branch || 'main' }}
+        run: |
+          set -euo pipefail
+          branch="$BRANCH"
+          if git merge-base --is-ancestor upstream/main "$branch"; then
+            echo "already-up-to-date=true" >> "$GITHUB_OUTPUT"
+            echo "Fork is already up to date with upstream/main."
+            exit 0
+          fi
+          git config user.name  "birdrock00[bot]"
+          git config user.email "birdrock00@users.noreply.github.com"
+          before=$(git rev-parse --short "$branch")
+          if ! git merge --no-ff upstream/main \
+               -m "Sync upstream/main into $branch ($(git rev-parse --short upstream/main))"; then
+            git merge --abort
+            echo "::error::Merging upstream/main conflicted. Resolve on $branch and re-run." >&2
+            exit 1
+          fi
+          git push origin "HEAD:$branch"
+          echo "already-up-to-date=false" >> "$GITHUB_OUTPUT"
+          echo "Merged: $before -> $(git rev-parse --short HEAD) (upstream $(git rev-parse --short upstream/main))"
+
+      - name: Report
+        if: steps.merge.outputs.already-up-to-date == 'true'
+        run: echo "No upstream changes to merge; fork is current."

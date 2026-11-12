@@ -1,0 +1,237 @@
+# Detect new releases on upstream (milind-soni/OpenMausBot) and publish them
+# from this fork: merge the release into main, tag it, create a GitHub
+# release, build the Docker image per the repo's Dockerfile (server target)
+# and push it to ghcr.io/birdrock00/openmausbot.
+#
+# GitHub has no cross-repo push event, so "new release" detection is a poll:
+# this workflow runs every 5 minutes, compares the upstream release list
+# against .github/release-state.json (committed in this fork) and publishes
+# the first release it has not seen yet. Latency to upstream publishing is
+# therefore at most ~5 minutes. `workflow_dispatch` allows publishing a
+# specific upstream tag on demand (force-republish if already seen).
+name: Release from upstream
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream release tag to publish (empty = latest upstream release)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: release-from-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: milind-soni/OpenMausBot
+  IMAGE: ghcr.io/birdrock00/openmausbot
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      tag: ${{ steps.pick.outputs.tag }}
+      commit: ${{ steps.pick.outputs.commit }}
+      publish: ${{ steps.decide.outputs.publish }}
+      latest: ${{ steps.pick.outputs.latest }}
+    steps:
+      - name: Checkout fork (state file lives here)
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 1
+
+      - name: List upstream releases
+        id: pick
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCED_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          releases=$(curl -fsS -H "Authorization: Bearer $GITHUB_TOKEN" \
+            https://api.github.com/repos/$UPSTREAM/releases?per_page=30)
+          latest=$(jq -r '.[0].tag_name' <<<"$releases")
+          if [ -n "${FORCED_TAG:-}" ]; then
+            entry=$(jq -r --arg t "$FORCED_TAG" '.[] | select(.tag_name == $t)' <<<"$releases")
+            if [ -z "$entry" ] || [ "$entry" = "null" ]; then
+              echo "::error::Upstream release '$FORCED_TAG' not found in the 30 most recent releases." >&2
+              exit 1
+            fi
+            tag="$FORCED_TAG"
+            commit=$(jq -r '.commit_url' <<<"$entry" | sed 's|.*commit/||')
+          else
+            tag="$latest"
+            commit=$(jq -r '.[0].commit_url' <<<"$releases" | sed 's|.*commit/||')
+          fi
+          echo "tag=$tag"      >> "$GITHUB_OUTPUT"
+          echo "commit=$commit" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+          echo "Upstream: latest=$latest, publishing=$tag ($commit)"
+
+      - name: Decide whether to publish
+        id: decide
+        env:
+          TAG: ${{ steps.pick.outputs.tag }}
+          FORCED: ${{ inputs.tag != '' }}
+        run: |
+          set -euo pipefail
+          state=.github/release-state.json
+          if [ -f "$state" ]; then
+            last=$(jq -r '.last_tag // empty' "$state")
+          else
+            last=""
+          fi
+          if [ "$FORCED" = "true" ]; then
+            publish=true
+            echo "Forced dispatch: publishing $TAG regardless of state (last seen: ${last:-none})."
+          elif [ "$TAG" = "$last" ]; then
+            publish=false
+            echo "Upstream latest ($TAG) already published here; nothing to do."
+          else
+            publish=true
+            echo "New upstream release $TAG (last seen: ${last:-none})."
+          fi
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: detect
+    if: needs.detect.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+          token: ${{ github.token }}
+
+      - name: Fetch the upstream release
+        env:
+          TAG: ${{ needs.detect.outputs.tag }}
+          COMMIT: ${{ needs.detect.outputs.commit }}
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/$UPSTREAM.git
+          # The tag object plus the commit it points at (works for annotated and lightweight tags).
+          git fetch upstream --no-tags "refs/tags/$TAG:refs/tags/$TAG" || \
+            git fetch upstream --tags
+          echo "tag $TAG -> $(git rev-parse 'refs/tags/$TAG^{commit}')"
+
+      - name: Bring main up to the release (and push it if it moved)
+        env:
+          TAG: ${{ needs.detect.outputs.tag }}
+        run: |
+          set -euo pipefail
+          commit=$(git rev-parse "refs/tags/$TAG^{commit}")
+          if git merge-base --is-ancestor "$commit" main; then
+            echo "main already contains release $TAG; no merge needed."
+          else
+            git config user.name  "birdrock00[bot]"
+            git config user.email "birdrock00@users.noreply.github.com"
+            if ! git merge --no-ff "refs/tags/$TAG" \
+                 -m "Merge upstream release $TAG into main"; then
+              git merge --abort
+              echo "::error::Merging release $TAG conflicted; resolve on main and re-run." >&2
+              exit 1
+            fi
+            git push origin main
+            echo "main advanced to $(git rev-parse --short HEAD) to include $TAG."
+          fi
+
+      - name: Tag and create the GitHub release
+        env:
+          TAG: ${{ needs.detect.outputs.tag }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          commit=$(git rev-parse "refs/tags/$TAG^{commit}")
+          # A tag fetched from upstream already points at the right commit;
+          # re-point it explicitly if the fork ever carried an old one.
+          if [ "$(git rev-parse "refs/tags/$TAG^{commit}")" != "$commit" ]; then
+            git tag -f -a "$TAG" "$commit" -m "OpenMausBot $TAG (mirrored from upstream)"
+          fi
+          git push origin "refs/tags/$TAG"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists on this fork; keeping it."
+          else
+            notes=$(curl -fsS -H "Authorization: Bearer $GITHUB_TOKEN" \
+              "https://api.github.com/repos/$UPSTREAM/releases/tags/$TAG" | jq -r '.body // "Mirrored from upstream."')
+            body=$notes gh release create "$TAG" \
+              --title "OpenMausBot ${TAG#v} (fork of upstream)" \
+              --notes-file <(echo "$body") \
+              --target "$commit"
+          fi
+
+      - name: Build the Docker image (repo Dockerfile, server target)
+        env:
+          TAG: ${{ needs.detect.outputs.tag }}
+        run: |
+          set -euo pipefail
+          docker build \
+            -t "$IMAGE:$TAG" \
+            $([ "${{ needs.detect.outputs.tag }}" = "${{ needs.detect.outputs.latest }}" ] && echo "-t $IMAGE:latest") \
+            .
+
+      - name: Push image to ghcr
+        env:
+          TAG: ${{ needs.detect.outputs.tag }}
+          IS_LATEST: ${{ needs.detect.outputs.tag == needs.detect.outputs.latest }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          echo "$REGISTRY_TOKEN" | docker login ghcr.io -u "$REGISTRY_USER" --password-stdin
+          docker push "$IMAGE:$TAG"
+          if [ "$IS_LATEST" = "true" ]; then
+            docker push "$IMAGE:latest"
+          fi
+          docker images "$IMAGE" || true
+
+      - name: Boot smoke test
+        env:
+          TAG: ${{ needs.detect.outputs.tag }}
+        run: |
+          set -euo pipefail
+          docker run -d --name omb-smoke --init --shm-size=512m "$IMAGE:$TAG"
+          ok=""
+          for i in $(seq 1 60); do
+            if docker exec omb-smoke curl -sf http://127.0.0.1:8799/api/health 2>/dev/null | grep -q openmausbot; then ok=1; break; fi
+            sleep 2
+          done
+          docker logs omb-smoke --tail 10 || true
+          if [ -z "$ok" ]; then echo "server never became healthy"; exit 1; fi
+          docker exec omb-smoke curl -sf http://127.0.0.1:8799/ | grep -qi "<html" || { echo "UI not served"; exit 1; }
+          echo "image $IMAGE:$TAG boots healthy and serves the UI"
+
+      - name: Record state
+        env:
+          TAG: ${{ needs.detect.outputs.tag }}
+          COMMIT: ${{ needs.detect.outputs.commit }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '{"last_tag": "%s", "last_commit": "%s"}\n' "$TAG" "$COMMIT" > .github/release-state.json
+          git config user.name  "birdrock00[bot]"
+          git config user.email "birdrock00@users.noreply.github.com"
+          git add .github/release-state.json
+          if git diff --cached --quiet; then
+            echo "state unchanged"
+          else
+            git commit -m "record upstream release $TAG as published"
+            # main may have been pushed already by the merge step; push again if state moved it.
+            git push origin main || {
+              # main moved under us (a concurrent sync merge); retry once on top of it.
+              git pull --no-rebase --no-edit origin main
+              git push origin main
+            }
+          fi
