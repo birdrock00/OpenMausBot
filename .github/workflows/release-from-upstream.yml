@@ -117,9 +117,14 @@ jobs:
         run: |
           set -euo pipefail
           git remote add upstream https://github.com/$UPSTREAM.git
-          # The tag object plus the commit it points at (works for annotated and lightweight tags).
-          git fetch upstream --no-tags "refs/tags/$TAG:refs/tags/$TAG" || \
-            git fetch upstream --tags
+          # The tag OBJECT is irrelevant (annotated tags carry tagger identity); the
+          # commit behind the tag is what matters. Checkout already creates a local
+          # copy of the fork's tag, so fetch with -f: without it, git refuses to
+          # clobber the local tag object and the whole fetch exits 1.
+          if ! git rev-parse --verify -q "refs/tags/$TAG^{commit}" >/dev/null; then
+            git fetch -f upstream "refs/tags/$TAG:refs/tags/$TAG" || \
+              git fetch -f upstream --tags
+          fi
           echo "tag $TAG -> $(git rev-parse 'refs/tags/$TAG^{commit}')"
 
       - name: Bring main up to the release (and push it if it moved)
