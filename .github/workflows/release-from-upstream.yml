@@ -56,7 +56,7 @@ jobs:
           FORCED_TAG: ${{ inputs.tag }}
         run: |
           set -euo pipefail
-          releases=$(curl -fsS -H "Authorization: Bearer $GITHUB_TOKEN" \
+          releases=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" \
             https://api.github.com/repos/$UPSTREAM/releases?per_page=30)
           latest=$(jq -r '.[0].tag_name' <<<"$releases")
           if [ -n "${FORCED_TAG:-}" ]; then
@@ -164,7 +164,7 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1; then
             echo "Release $TAG already exists on this fork; keeping it."
           else
-            notes=$(curl -fsS -H "Authorization: Bearer $GITHUB_TOKEN" \
+            notes=$(curl -fsS -H "Authorization: Bearer $GH_TOKEN" \
               "https://api.github.com/repos/$UPSTREAM/releases/tags/$TAG" | jq -r '.body // "Mirrored from upstream."')
             body=$notes gh release create "$TAG" \
               --title "OpenMausBot ${TAG#v} (fork of upstream)" \
