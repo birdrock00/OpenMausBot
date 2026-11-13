@@ -223,6 +223,37 @@ FROM runtime AS server
 # Optional engine CLIs baked into the image (space-separated npm packages).
 ARG ENGINES=""
 RUN if [ -n "$ENGINES" ]; then HOME=/tmp/omb-build-home npm install -g $ENGINES && rm -rf /tmp/omb-build-home /tmp/node-compile-cache; fi
+# The bot shell's toolset for the finance pipelines (fastrak-to-owncloud, the
+# banking-to-actual/sure skills, vaultwarden-access): Python for the PDF
+# receiver and the Vaultwarden API fallback, poppler for statement sanity
+# checks, jq and unzip, psmisc for port-based cleanup, uv for throwaway venvs,
+# and kubectl for the in-cluster ownCloud app-token re-mint fallback. The same
+# core set the cloud-home stage carries, so a bot script runs in either box.
+ARG UV_VERSION=0.13.4
+ARG TARGETARCH
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends python3 python3-venv poppler-utils jq unzip psmisc \
+  && rm -rf /var/lib/apt/lists/* \
+  && uv_arch=x86_64 && if [ "$TARGETARCH" = arm64 ]; then uv_arch=aarch64; fi \
+  && mkdir -p /tmp/uv-install \
+  && curl -fsSL "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-${uv_arch}-unknown-linux-gnu.tar.gz" | tar -xz -C /tmp/uv-install --strip-components=1 \
+  && install -m 0755 /tmp/uv-install/uv /tmp/uv-install/uvx /usr/local/bin/ \
+  && kubectl_arch=amd64 && if [ "$TARGETARCH" = arm64 ]; then kubectl_arch=arm64; fi \
+  && curl -fsSL "https://dl.k8s.io/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/${kubectl_arch}/kubectl" -o /usr/local/bin/kubectl \
+  && chmod 0755 /usr/local/bin/kubectl \
+  && python3 --version && pdfinfo -v 2>&1 | head -1 && jq --version \
+  && kubectl version --client >/dev/null && uv --version \
+  && rm -rf /tmp/uv-install /tmp/node-compile-cache
+# Vaultwarden's bw CLI and the Playwright MCP shim, on every user's PATH and
+# out of the volume: the image's /usr is what a bot's box sees, so both are
+# reachable from every bot shell without per-bot setup. Bots point
+# playwright-mcp at the image's Chrome for Testing (--executable-path
+# /opt/openmausbot-browser/chrome, docs/browser-packaging.md) instead of a
+# downloaded browser.
+RUN HOME=/tmp/omb-build-home npm install -g --no-audit --no-fund @bitwarden/cli @playwright/mcp \
+  && bw --version \
+  && node -e "console.log(require('/usr/local/lib/node_modules/@playwright/mcp/package.json').version)" \
+  && rm -rf /tmp/omb-build-home /tmp/node-compile-cache
 COPY --from=build --chown=maus:maus /src/dist-native/duckdb/target ./duckdb
 COPY --from=build --chown=maus:maus /src/dist-server ./dist-server
 COPY --from=build --chown=maus:maus /src/dist ./dist
