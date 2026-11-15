@@ -3,17 +3,14 @@
 # release, build the Docker image per the repo's Dockerfile (server target)
 # and push it to ghcr.io/birdrock00/openmausbot.
 #
-# GitHub has no cross-repo push event, so "new release" detection is a poll:
-# this workflow runs every 5 minutes, compares the upstream release list
-# against .github/release-state.json (committed in this fork) and publishes
-# the first release it has not seen yet. Latency to upstream publishing is
-# therefore at most ~5 minutes. `workflow_dispatch` allows publishing a
+# GitHub has no cross-repo push event, so "new release" detection is manual:
+# a workflow_dispatch run compares the upstream release list against
+# .github/release-state.json (committed in this fork) and publishes the first
+# release it has not seen yet. `workflow_dispatch` also allows publishing a
 # specific upstream tag on demand (force-republish if already seen).
 name: Release from upstream
 
 on:
-  schedule:
-    - cron: "*/5 * * * *"
   workflow_dispatch:
     inputs:
       tag:

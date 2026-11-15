@@ -1,5 +1,5 @@
 # Fork maintenance: pull all changes from upstream (milind-soni/OpenMausBot)
-# into this fork's main branch. Runs daily, on demand, and as a fallback for
+# into this fork's main branch. Runs on demand, and as a fallback for
 # release-from-upstream.yml's merge step.
 #
 # The fork only ever diverges from upstream in .github/workflows/ (this file
@@ -8,8 +8,6 @@
 name: Sync upstream
 
 on:
-  schedule:
-    - cron: "30 6 * * *" # daily, 06:30 UTC
   workflow_dispatch:
     inputs:
       branch:
